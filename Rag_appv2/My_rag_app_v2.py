@@ -64,6 +64,30 @@ def load_document(file_path):
     
     return documents
 
+# SIMPLE GREETING DETECTION
+# Prevent casual greetings like "Hi" from triggering large RAG context lookups
+# and keep the assistant response short and friendly.
+def is_simple_greeting(query):
+    normalized = query.strip().lower()
+    greetings = [
+        "hi", "hello", "hey", "hi there", "hello there",
+        "good morning", "good afternoon", "good evening",
+        "how are you", "what's up", "whats up"
+    ]
+    if len(normalized) > 40:
+        return False
+    return any(normalized == greeting or normalized.startswith(greeting + " ") or normalized.endswith(" " + greeting) for greeting in greetings)
+
+
+def is_affirmative(query):
+    normalized = query.strip().lower()
+    return normalized in ["yes", "y", "yeah", "yep", "sure", "ok", "okay", "please do", "please"]
+
+
+def is_negative(query):
+    normalized = query.strip().lower()
+    return normalized in ["no", "n", "nope", "not now", "don't", "do not", "nah"]
+
 # LOAD METADATA
 def load_metadata():
     """Load previously processed files list"""
@@ -108,6 +132,21 @@ def load_new_documents(folder_path, new_files):
         except Exception as e:
             st.warning(f"⚠️ Couldn't load {file}: {str(e)}")
     
+    return documents
+
+# LOAD ALL DOCUMENTS FROM SUPPORTED FILES
+# This supports .pdf, .txt, .docx, .doc, and .html files in the IPL DB folder.
+def load_all_documents(folder_path):
+    documents = []
+    for file in get_supported_files(folder_path):
+        full_path = os.path.join(folder_path, file)
+        try:
+            docs = load_document(full_path)
+            documents.extend(docs)
+        except Exception as e:
+            st.warning(f"⚠️ Couldn't load {file}: {str(e)}")
+    if not documents:
+        raise FileNotFoundError(f"No supported documents found in '{folder_path}'")
     return documents
 
 # LOAD ALL PDF FILES
@@ -211,17 +250,6 @@ if "chat_history" not in st.session_state:
 if "db_initialized" not in st.session_state:
     st.session_state.db_initialized = False
 
-if "use_general_knowledge" not in st.session_state:
-    st.session_state.use_general_knowledge = False
-
-# SIDEBAR SETTINGS
-st.sidebar.header("⚙️ Settings")
-st.session_state.use_general_knowledge = st.sidebar.checkbox(
-    "🌐 Allow General Knowledge Search",
-    value=st.session_state.use_general_knowledge,
-    help="If no data found in database, search LLM's general knowledge"
-)
-
 # LOAD VECTOR DB & AUTO UPDATE
 try:
     if not os.path.exists(DB_FOLDER):
@@ -258,7 +286,47 @@ for msg in st.session_state.chat_history:
     st.chat_message(msg["role"]).write(msg["content"])
 
 # USER INPUT
-query = st.chat_input("Ask about IPL Cricket...")
+query = st.chat_input("Ask about IPL Cricket...", key="query_input")
+
+# Auto-focus the prompt input on initial load and after rerender.
+st.markdown(
+    """
+    <script>
+    const focusPrompt = () => {
+      const selector = 'input[placeholder="Ask about IPL Cricket..."], textarea[placeholder="Ask about IPL Cricket..."]';
+      const el = document.querySelector(selector);
+      if (el) {
+        el.focus();
+        el.scrollIntoView({behavior: 'smooth', block: 'center'});
+        return true;
+      }
+      return false;
+    };
+
+    const intervalId = window.setInterval(() => {
+      if (focusPrompt()) {
+        window.clearInterval(intervalId);
+      }
+    }, 200);
+
+    window.addEventListener('load', () => {
+      focusPrompt();
+    });
+
+    document.addEventListener('readystatechange', () => {
+      if (document.readyState === 'complete') {
+        focusPrompt();
+      }
+    });
+
+    window.setTimeout(() => {
+      focusPrompt();
+      window.clearInterval(intervalId);
+    }, 3000);
+    </script>
+    """,
+    unsafe_allow_html=True,
+)
 
 # ASK AI
 if query:
@@ -267,83 +335,115 @@ if query:
     st.chat_message("user").write(query)
 
     try:
-        docs = st.session_state.vectorstore.similarity_search(query, k=5)
-        context = "\n\n".join([doc.page_content for doc in docs])
-        has_local_data = len(context.strip()) > 0
+        if is_simple_greeting(query):
+            answer = "Hi! 👋 I’m your IPL Cricket assistant. Ask me anything about IPL teams, players, matches, or stats."
 
-        # Build prompt based on whether local data exists
-        if has_local_data:
-            prompt = f"""
+        elif st.session_state.get("await_global_permission", False):
+            if is_affirmative(query):
+                prompt = f"""
 You are an expert IPL cricket analyst and commentator.
+Answer the user's question using your global knowledge only.
+Do not use, reference, or transfer any content from the internal IPL database.
+Answer the question clearly and concisely.
 
-Use the IPL data context below to answer the question.
+User Question:
+{st.session_state.get('pending_query', query)}
+"""
+                payload = {
+                    "model": "llama3:8b",
+                    "messages": [
+                        {"role": "user", "content": prompt}
+                    ],
+                    "stream": False
+                }
 
-Provide:
-- Detailed information based on the data
-- Statistics and facts
-- Player insights if relevant
-- Match information
+                headers = {"Content-Type": "application/json"}
+
+                with st.spinner("Thinking..."):
+                    response = requests.post(
+                        OLLAMA_API,
+                        json=payload,
+                        headers=headers,
+                        timeout=180
+                    )
+
+                    if response.status_code != 200:
+                        raise Exception(f"Ollama API error: {response.text}")
+
+                    result = response.json()
+                    answer = result.get("message", {}).get("content", "No response from model")
+
+                st.session_state.await_global_permission = False
+                st.session_state.pending_query = None
+
+            elif is_negative(query):
+                answer = "Okay, I will not use global sources. Please ask another IPL question or a different query."
+                st.session_state.await_global_permission = False
+                st.session_state.pending_query = None
+            else:
+                answer = "Please answer 'yes' or 'no': can I check the global source for your question?"
+
+        else:
+            docs = st.session_state.vectorstore.similarity_search(query, k=3)
+            context = "\n\n".join([doc.page_content for doc in docs])
+            has_local_data = len(context.strip()) > 0
+
+            if has_local_data:
+                prompt = f"""
+You are an expert IPL cricket analyst and commentator.
+Use only the IPL data context below to answer the question.
+Do not invent extra details or use unrelated data.
+If the context is not enough to answer the question, respond exactly: NO_MATCH
+Answer clearly and concisely.
 
 IPL Data Context:
 {context}
 
 User Question:
 {query}
-
-Answer based on the IPL data:
 """
-        else:
-            # No local data found
-            if st.session_state.use_general_knowledge:
-                prompt = f"""
-You are an expert IPL cricket analyst and commentator.
+                payload = {
+                    "model": "llama3:8b",
+                    "messages": [
+                        {"role": "user", "content": prompt}
+                    ],
+                    "stream": False
+                }
 
-The user asked: {query}
+                headers = {"Content-Type": "application/json"}
 
-No specific information was found in the local IPL database.
-You can provide answer based on your general knowledge of IPL cricket.
+                with st.spinner("Thinking..."):
+                    response = requests.post(
+                        OLLAMA_API,
+                        json=payload,
+                        headers=headers,
+                        timeout=180
+                    )
 
-Answer:
-"""
+                    if response.status_code != 200:
+                        raise Exception(f"Ollama API error: {response.text}")
+
+                    result = response.json()
+                    answer = result.get("message", {}).get("content", "No response from model")
+
+                if answer is None:
+                    answer = "No response from model"
+                cleaned = answer.strip().upper()
+                if cleaned == "NO_MATCH" or cleaned.startswith("NO_MATCH"):
+                    answer = (
+                        "Sorry, I don't have the proper information for your question in the internal database. "
+                        "Can I try to answer it from the global source? Please reply 'yes' or 'no'."
+                    )
+                    st.session_state.await_global_permission = True
+                    st.session_state.pending_query = query
+
             else:
-                prompt = f"""
-You are an expert IPL cricket analyst and commentator.
-
-User Question:
-{query}
-
-The information about this topic is not available in the IPL database.
-Please tell the user that this information is not available in the local database.
-"""
-
-        # Call Ollama API
-        payload = {
-            "model": "llama3:8b",
-            "messages": [
-                {"role": "user", "content": prompt}
-            ],
-            "stream": False
-        }
-
-        headers = {"Content-Type": "application/json"}
-
-        with st.spinner("Thinking..."):
-            response = requests.post(
-                OLLAMA_API,
-                json=payload,
-                headers=headers,
-                timeout=180
-            )
-
-            if response.status_code != 200:
-                raise Exception(f"Ollama API error: {response.text}")
-
-            result = response.json()
-            answer = result.get("message", {}).get("content", "No response from model")
-            
-            # Add note if using general knowledge
-            if not has_local_data and st.session_state.use_general_knowledge:
-                answer = f"ℹ️ **Using General Knowledge** (No local database match found)\n\n{answer}"
+                answer = (
+                    "Sorry, I don't have the proper information for your question in the internal database. "
+                    "Can I try to answer it from the global source? Please reply 'yes' or 'no'."
+                )
+                st.session_state.await_global_permission = True
+                st.session_state.pending_query = query
 
     except requests.exceptions.Timeout:
         answer = "❌ **Timeout Error**: Ollama is taking too long to respond.\n\n**Solutions:**\n1. Make sure Ollama is running: `ollama serve`\n2. Try asking a simpler question\n3. Increase timeout in settings (currently 180 seconds)\n\nCheck that you have Ollama installed and the 'llama3:8b' model downloaded."
