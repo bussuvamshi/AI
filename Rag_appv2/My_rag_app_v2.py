@@ -2,10 +2,19 @@ import os
 import streamlit as st
 import requests
 import json
+import warnings
 from datetime import datetime
+from docx import Document as DocxDocument
+
+# Suppress non-critical warnings
+warnings.filterwarnings("ignore", category=UserWarning, module="langchain_core._api.deprecation")
+warnings.filterwarnings("ignore", message="Core Pydantic V1 functionality isn't compatible with Python 3.14")
+warnings.filterwarnings("ignore", message="Accessing `__path__` from")
+os.environ["HF_HUB_DISABLE_IMPLICIT_TOKEN"] = "1"
 
 from langchain_community.document_loaders import PyPDFLoader, TextLoader, UnstructuredHTMLLoader
 from langchain_community.document_loaders import UnstructuredWordDocumentLoader
+from langchain_core.documents import Document
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_community.vectorstores import FAISS
 from langchain_huggingface import HuggingFaceEmbeddings
@@ -27,6 +36,7 @@ def create_vectorstore(chunks):
     embeddings = load_embeddings()
     return FAISS.from_documents(chunks, embeddings)
 
+
 # GET LIST OF SUPPORTED FILES
 def get_supported_files(folder_path):
     """Get list of all supported document files in folder"""
@@ -36,6 +46,9 @@ def get_supported_files(folder_path):
     files = []
     for file in os.listdir(folder_path):
         file_lower = file.lower()
+        # Skip temporary Word files (starting with ~$)
+        if file.startswith('~$'):
+            continue
         if any(file_lower.endswith(ext) for ext in SUPPORTED_EXTENSIONS):
             files.append(file)
     return sorted(files)
@@ -54,8 +67,22 @@ def load_document(file_path):
             loader = TextLoader(file_path, encoding='utf-8')
             documents = loader.load()
         elif file_lower.endswith(('.docx', '.doc')):
-            loader = UnstructuredWordDocumentLoader(file_path)
-            documents = loader.load()
+            try:
+                # Try UnstructuredWordDocumentLoader first
+                loader = UnstructuredWordDocumentLoader(file_path)
+                documents = loader.load()
+            except Exception as unstructured_error:
+                print(f"UnstructuredWordDocumentLoader failed, trying python-docx fallback: {unstructured_error}")
+                try:
+                    # Fallback: use python-docx directly
+                    doc = DocxDocument(file_path)
+                    text_content = "\n".join([para.text for para in doc.paragraphs])
+                    if text_content.strip():
+                        documents = [Document(page_content=text_content, metadata={"source": file_path})]
+                    print(f"✅ Successfully loaded {file_path} using python-docx fallback")
+                except Exception as docx_error:
+                    print(f"❌ python-docx also failed for {file_path}: {docx_error}")
+                    raise docx_error
         elif file_lower.endswith('.html'):
             loader = UnstructuredHTMLLoader(file_path)
             documents = loader.load()
@@ -128,9 +155,15 @@ def load_new_documents(folder_path, new_files):
         full_path = os.path.join(folder_path, file)
         try:
             docs = load_document(full_path)
-            documents.extend(docs)
+            if docs:
+                documents.extend(docs)
+                print(f"✅ Loaded {file}: {len(docs)} documents")
+            else:
+                print(f"⚠️ No documents loaded from {file}")
         except Exception as e:
-            st.warning(f"⚠️ Couldn't load {file}: {str(e)}")
+            error_msg = f"❌ Error loading {file}: {str(e)}"
+            print(error_msg)
+            st.warning(error_msg)
     
     return documents
 
@@ -198,13 +231,19 @@ def update_vector_db(vectorstore):
     """Add new documents to existing vector database"""
     new_files = get_new_files(PDF_FOLDER)
     
+    print(f"\n🔍 Update Check:")
+    print(f"  New files detected: {new_files}")
+    
     if not new_files:
         return vectorstore, 0
     
     # Load only new files
     new_docs = load_new_documents(PDF_FOLDER, new_files)
     
+    print(f"  Documents loaded: {len(new_docs)}")
+    
     if not new_docs:
+        print(f"  ⚠️ No documents to add!")
         return vectorstore, 0
     
     # Split new documents
@@ -214,14 +253,18 @@ def update_vector_db(vectorstore):
     )
     split_new_docs = text_splitter.split_documents(new_docs)
     
+    print(f"  Chunks created: {len(split_new_docs)}")
+    
     # Add to existing vectorstore
     embeddings = load_embeddings()
     vectorstore.add_documents(split_new_docs)
     vectorstore.save_local(DB_FOLDER)
     
-    # Update metadata
+    # Update metadata - IMPORTANT: save ALL current files, not just new ones
     all_files = get_supported_files(PDF_FOLDER)
     save_metadata(all_files)
+    
+    print(f"  ✅ Updated metadata with all files: {all_files}\n")
     
     return vectorstore, len(new_files)
 
@@ -263,23 +306,19 @@ try:
             vectorstore = load_vector_db()
             st.session_state.vectorstore = vectorstore
             st.session_state.db_initialized = True
-            
-            # CHECK FOR NEW FILES & AUTO UPDATE
-            new_files = get_new_files(PDF_FOLDER)
-            if len(new_files) > 0:
-                with st.spinner(f"Auto-updating database with {len(new_files)} new file(s)..."):
-                    vectorstore, updated_count = update_vector_db(vectorstore)
-                    st.session_state.vectorstore = vectorstore
-                    if updated_count > 0:
-                        st.success(f"✅ Auto-updated! Added {updated_count} new file(s)")
+    
+    # CHECK FOR NEW FILES & AUTO UPDATE (runs on every rerun)
+    if st.session_state.db_initialized and st.session_state.vectorstore is not None:
+        new_files = get_new_files(PDF_FOLDER)
+        if len(new_files) > 0:
+            with st.spinner(f"Auto-updating database with {len(new_files)} new file(s)..."):
+                vectorstore, updated_count = update_vector_db(st.session_state.vectorstore)
+                st.session_state.vectorstore = vectorstore
+                if updated_count > 0:
+                    st.success(f"✅ Auto-updated! Added {updated_count} new file(s) - {', '.join(new_files)}")
 except Exception as e:
     st.error(f"❌ Error loading database: {str(e)}")
     st.stop()
-
-# SHOW DATABASE STATUS
-supported_files = get_supported_files(PDF_FOLDER)
-metadata = load_metadata()
-processed = metadata.get("processed_files", [])
 
 # DISPLAY CHAT HISTORY
 for msg in st.session_state.chat_history:
